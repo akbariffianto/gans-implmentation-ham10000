@@ -1,305 +1,316 @@
 import streamlit as st
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import models, transforms
-from PIL import Image
+import os
 import pandas as pd
 import numpy as np
-import cv2  # Library Computer Vision
-import os
+from PIL import Image
+from collections import OrderedDict
+
+# --- IMPORT ARSITEKTUR ---
+from model import ResNet50_Conventional, ResNet50_Deep
+from gan_architectures import GeneratorACGAN, GeneratorWGANGP, GeneratorACWGANGP
+
+# --- IMPORT UTILS ---
+from utils import (
+    process_image_opencv, 
+    get_transform, 
+    predict_probabilities,
+    generate_heatmap,
+    CLASS_NAMES, 
+    DEVICE
+)
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(
-    page_title="Skin Disease Classifier",
-    page_icon="🔬",
+    page_title="Skin Disease Analysis & Synthesis",
     layout="wide"
 )
 
-# ==========================================
-# 1. DEFINISI ARSITEKTUR MODEL
-# ==========================================
-class SoftAttention(nn.Module):
-    def __init__(self, in_channels, k_maps=16):
-        super(SoftAttention, self).__init__()
-        self.in_channels = in_channels
-        self.k = k_maps
-        self.attn_conv = nn.Conv2d(in_channels, k_maps, kernel_size=1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        attn_maps = self.attn_conv(x)
-        b, k, h, w = attn_maps.size()
-        attn_maps = attn_maps.view(b, k, -1)
-        attn_maps = F.softmax(attn_maps, dim=-1)
-        attn_maps = attn_maps.view(b, k, h, w)
-        scaled_attn = attn_maps * self.gamma
-        out = torch.cat([x, scaled_attn], dim=1)
-        return out
-
-class SoftAttentionModule(nn.Module):
-    def __init__(self, in_channels, k_maps=16):
-        super(SoftAttentionModule, self).__init__()
-        self.relu1 = nn.ReLU()
-        self.maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.soft_attention = SoftAttention(in_channels, k_maps)
-        self.maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.relu2 = nn.ReLU()
-        self.dropout = nn.Dropout(0.5)
-
-    def forward(self, x):
-        x = self.relu1(x)
-        path1 = self.maxpool1(x)
-        path2_out = self.soft_attention(x)
-        path2 = self.maxpool2(path2_out)
-        out = torch.cat([path1, path2], dim=1)
-        out = self.relu2(out)
-        out = self.dropout(out)
-        return out
-
-class ModifiedResNet50(nn.Module):
-    def __init__(self, num_classes=7, k_attention_maps=16):
-        super(ModifiedResNet50, self).__init__()
-        original_resnet = models.resnet50(weights=None) 
-        self.features = nn.Sequential(
-            original_resnet.conv1,
-            original_resnet.bn1,
-            original_resnet.relu,
-            original_resnet.maxpool,
-            original_resnet.layer1,
-            original_resnet.layer2,
-            original_resnet.layer3
-        )
-        feature_channels = 1024 
-        self.sa_module = SoftAttentionModule(in_channels=feature_channels, k_maps=k_attention_maps)
-        final_channels = feature_channels + (feature_channels + k_attention_maps)
-        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier = nn.Linear(final_channels, num_classes)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.sa_module(x)
-        x = self.global_avg_pool(x)
-        x = torch.flatten(x, 1)
-        x = self.classifier(x)
-        return x
+# Filter kelas untuk Generator
+GEN_CLASSES = [c for c in CLASS_NAMES if 'nv' not in c.lower()]
+NUM_GEN_CLASSES = len(GEN_CLASSES)
 
 # ==========================================
-# 2. HELPER FUNCTION: SMART PREPROCESSING
+# 1. FUNGSI LOAD MODEL (CACHED)
 # ==========================================
-def remove_hair(image_cv):
-    """Menghilangkan rambut menggunakan BlackHat Morphological Operation"""
-    # 1. Convert ke Grayscale
-    gray = cv2.cvtColor(image_cv, cv2.COLOR_RGB2GRAY)
-    
-    # 2. Kernel untuk mendeteksi struktur tipis (rambut)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
-    
-    # 3. BlackHat transform (menemukan objek gelap di latar terang)
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    
-    # 4. Thresholding untuk membuat mask rambut
-    _, thresh = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
-    
-    # 5. Inpainting (menambal area rambut dengan pixel sekitarnya)
-    final_image = cv2.inpaint(image_cv, thresh, 1, cv2.INPAINT_TELEA)
-    
-    return final_image
-
-def crop_contour(image_cv):
-    """Mencari kontur terbesar (kulit) dan crop area tersebut"""
-    # 1. Convert ke Grayscale & Blur
-    gray = cv2.cvtColor(image_cv, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # 2. Otsu Thresholding (Memisahkan foreground/kulit dari background gelap/terang)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 3. Cari Kontur
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return image_cv # Jika gagal nemu kontur, kembalikan gambar asli
-    
-    # 4. Ambil kontur dengan area TERBESAR (asumsi itu adalah lesi/kulit)
-    c = max(contours, key=cv2.contourArea)
-    
-    # 5. Buat Bounding Box (Kotak)
-    x, y, w, h = cv2.boundingRect(c)
-    
-    # Validasi: Jangan crop jika kotaknya terlalu kecil (noise)
-    h_img, w_img, _ = image_cv.shape
-    if w < w_img * 0.1 or h < h_img * 0.1: 
-        return image_cv
-        
-    # 6. Crop Gambar
-    cropped = image_cv[y:y+h, x:x+w]
-    return cropped
-
-def process_image_opencv(pil_image, use_hair_removal=True, use_cropping=True):
-    # Convert PIL ke OpenCV (Numpy)
-    img_cv = np.array(pil_image)
-    
-    # OpenCV pakai BGR, PIL pakai RGB. Streamlit tampilkan RGB.
-    # Kita proses dalam mode RGB saja biar aman.
-    
-    processed = img_cv.copy()
-    
-    if use_cropping:
-        try:
-            processed = crop_contour(processed)
-        except Exception:
-            pass # Fallback ke gambar asli jika error
-            
-    if use_hair_removal:
-        try:
-            processed = remove_hair(processed)
-        except Exception:
-            pass
-
-    # Convert balik ke PIL
-    return Image.fromarray(processed)
-
-
-# ==========================================
-# 3. CONFIG & LOAD MODEL
-# ==========================================
-CLASS_NAMES = [
-    'Actinic Keratoses (akiec)', 'Basal Cell Carcinoma (bcc)', 'Benign Keratosis (bkl)', 
-    'Dermatofibroma (df)', 'Melanoma (mel)', 'Melanocytic Nevi (nv)', 'Vascular Lesions (vasc)'
-]
-NUM_CLASSES = len(CLASS_NAMES)
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def get_transform():
-    return transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
 
 @st.cache_resource
-def load_models():
+def load_classifiers():
     models_dict = {}
-    model_paths = {
-        "ResNet50 (Augmentasi Normal)": "models/1_ResNet50_Conventional.pth",
-        "ResNet50 (ACGAN)": "models/1_ResNet50_ACGAN.pth",
-        "ResNet50 (WGAN-GP)": "models/1_ResNet50_WGAN.pth",
-        "ResNet50 (ACWGAN-GP)": "models/1_ResNet50_ACWGAN.pth",
+    
+    model_configs = {
+        "ResNet50 (Konvensional)": {
+            "path": "models/1_ResNet50_Conventional.pth",
+            "class": ResNet50_Conventional
+        },
+        "ResNet50 (ACGAN)": {
+            "path": "models/ACGAN_SoftAttn.pth",
+            "class": ResNet50_Deep
+        },
+        "ResNet50 (ACWGAN-GP)": {
+            "path": "models/ACWGANGP_SoftAttn.pth",
+            "class": ResNet50_Deep
+        },
     }
-    for name, path in model_paths.items():
-        try:
-            if os.path.exists(path):
-                model = ModifiedResNet50(num_classes=NUM_CLASSES)
+    
+    for name, config in model_configs.items():
+        path = config["path"]
+        ModelClass = config["class"]
+        
+        if os.path.exists(path):
+            try:
+                model = ModelClass(num_classes=len(CLASS_NAMES))
                 state_dict = torch.load(path, map_location=DEVICE)
-                model.load_state_dict(state_dict)
+                
+                # Fix key names if needed
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    name_key = k.replace("module.", "")
+                    new_state_dict[name_key] = v
+                
+                model.load_state_dict(new_state_dict, strict=False)
                 model.to(DEVICE)
                 model.eval()
                 models_dict[name] = model
-            else:
+            except Exception as e:
+                st.error(f"Gagal memuat {name}: {e}")
                 models_dict[name] = None
-        except Exception:
+        else:
             models_dict[name] = None
     return models_dict
 
-def predict_probabilities(model, image_tensor):
-    with torch.no_grad():
-        image_tensor = image_tensor.to(DEVICE)
-        outputs = model(image_tensor)
-        probabilities = torch.nn.functional.softmax(outputs, dim=1)
-        return probabilities.cpu().numpy()[0]
-
-# --- UI UTAMA ---
-st.title("🔬 Analisis Penyakit Kulit Multi-Model")
-
-loaded_models = load_models()
-
-with st.sidebar:
-    st.header("Upload Citra")
-    uploaded_file = st.file_uploader("Format: JPG, PNG", type=["jpg", "png", "jpeg"])
+@st.cache_resource
+def load_generator(model_type):
+    config = {}
     
-    st.divider()
-    st.header("⚙️ Preprocessing (PENTING)")
-    st.info("Aktifkan fitur ini jika gambar mengandung rambut atau background mengganggu.")
-    
-    # OPSI PREPROCESSING
-    use_cleaner = st.toggle("🔍 Aktifkan Auto-Cleaning", value=True)
-    
-    st.caption(f"Device: {str(DEVICE).upper()}")
+    # Konfigurasi parameter (Pastikan gan_architectures.py sudah fixed ConvTranspose2d)
+    if model_type == "ACGAN":
+        config = {
+            "path": "gans/ACGAN_WeightLoss.pth",
+            "class": GeneratorACGAN,
+            "feature_size": 64,  # ACGAN base 64
+            "conditional": True
+        }
+    elif model_type == "WGAN-GP":
+        config = {
+            "path": "gans/WGANGP_WeightLoss.pth",
+            "class": GeneratorWGANGP,
+            "feature_size": 32,  # WGAN base 32
+            "conditional": False
+        }
+    elif model_type == "ACWGAN-GP":
+        config = {
+            "path": "gans/ACWGANGP_WeightLoss.pth",
+            "class": GeneratorACWGANGP,
+            "feature_size": 32,  # ACWGAN base 32
+            "conditional": True
+        }
 
-if uploaded_file is not None:
-    col_img, col_ctrl = st.columns([1, 1], gap="large") 
-    
-    # 1. LOAD IMAGE ASLI
-    original_image = Image.open(uploaded_file).convert('RGB')
-    
-    # 2. PROSES GAMBAR (JIKA TOGGLE AKTIF)
-    if use_cleaner:
-        final_image = process_image_opencv(original_image, use_hair_removal=True, use_cropping=True)
-    else:
-        final_image = original_image
+    if not os.path.exists(config["path"]):
+        st.error(f"File model tidak ditemukan: {config['path']}")
+        return None, False
 
-    with col_img:
-        # Tampilkan Perbandingan jika Cleaning Aktif
-        if use_cleaner:
-            tab1, tab2 = st.tabs(["🖼️ Final (Bersih)", "📂 Asli"])
-            with tab1:
-                st.image(final_image, use_container_width=True, caption="Siap Diprediksi (Hair Removal + Crop)")
-            with tab2:
-                st.image(original_image, use_container_width=True, caption="Upload Asli")
-        else:
-            st.image(original_image, use_container_width=True, caption="Citra Input")
-
-    with col_ctrl:
-        st.subheader("Persetujuan Medis")
-        st.warning("""
-        **PERHATIAN:** Aplikasi ini menggunakan AI dan hasil prediksi **bukan** diagnosis medis final. 
-        Kesalahan prediksi mungkin terjadi. Konsultasikan dengan dokter spesialis kulit.
-        """, icon="⚠️")
+    try:
+        ModelClass = config["class"]
         
-        agree = st.checkbox("Saya mengerti dan menyetujui pernyataan di atas.")
-        st.markdown("---")
-        run_btn = st.button("🚀 Jalankan Diagnosis", type="primary", use_container_width=True)
+        # Inisialisasi Model
+        if model_type == "ACGAN":
+            generator = ModelClass(num_classes=NUM_GEN_CLASSES, latent_dim=100, feature_size=config["feature_size"])
+        elif model_type == "WGAN-GP":
+            generator = ModelClass(latent_dim=100, feature_size=config["feature_size"])
+        elif model_type == "ACWGAN-GP":
+            generator = ModelClass(num_classes=NUM_GEN_CLASSES, latent_dim=100, feature_size=config["feature_size"])
 
-    if run_btn:
-        if not agree:
-            with col_ctrl:
-                st.error("⛔ Harap centang persetujuan di atas.")
+        # Load Checkpoint (Extract netG)
+        checkpoint = torch.load(config["path"], map_location=DEVICE)
+        
+        if isinstance(checkpoint, dict) and 'netG' in checkpoint:
+            state_dict = checkpoint['netG']
         else:
+            state_dict = checkpoint
+
+        # Clean keys
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name_key = k.replace("module.", "")
+            new_state_dict[name_key] = v
+
+        generator.load_state_dict(new_state_dict)
+        generator.to(DEVICE)
+        generator.eval()
+        
+        return generator, config["conditional"]
+
+    except Exception as e:
+        st.error(f"Error loading {model_type}: {e}")
+        return None, False
+
+# ==========================================
+# UI UTAMA
+# ==========================================
+
+st.title("Sistem Klasifikasi & Sintesis Penyakit Kulit")
+
+tab_classify, tab_synthesis = st.tabs(["Diagnosa & Klasifikasi", "Sintesis Generator (Augmentasi)"])
+
+# ==========================================
+# TAB 1: KLASIFIKASI & HEATMAP
+# ==========================================
+with tab_classify:
+    loaded_models = load_classifiers()
+    
+    with st.sidebar:
+        st.header("Input Citra Klasifikasi")
+        uploaded_file = st.file_uploader("Upload Citra Klinis", type=["jpg", "png", "jpeg"], key="cls_uploader")
+        st.divider()
+        use_cleaner = st.toggle("Aktifkan Auto-Cleaning", value=True)
+        st.caption(f"Device: {str(DEVICE).upper()}")
+
+    if uploaded_file is not None:
+        # --- BAGIAN 1: INPUT IMAGE ---
+        col_img, col_btn = st.columns([1, 2]) 
+        original_image = Image.open(uploaded_file).convert('RGB')
+        
+        if use_cleaner:
+            final_image = process_image_opencv(original_image, use_hair_removal=True, use_cropping=True)
+        else:
+            final_image = original_image
+
+        with col_img:
+            t1, t2 = st.tabs(["Siap Diprediksi", "Original"])
+            with t1: st.image(final_image, use_container_width=True, caption="Citra Input Model")
+            with t2: st.image(original_image, use_container_width=True, caption="Citra Asli")
+
+        with col_btn:
+            st.info("Sistem siap. Klik tombol di bawah untuk menjalankan analisis komparatif dan visualisasi Soft Attention.")
+            run_btn = st.button("🚀 Mulai Diagnosis", type="primary")
+
+        # --- BAGIAN 2: HASIL HORIZONTAL (HEATMAP DI BAWAH INPUT) ---
+        if run_btn:
             st.divider()
-            with st.spinner("Menganalisis citra yang sudah dibersihkan..."):
+            st.subheader("📊 Hasil Diagnosis & Visualisasi Lesi")
+            
+            with st.spinner("Sedang menganalisis citra & generate heatmap..."):
                 transform = get_transform()
-                # GUNAKAN FINAL IMAGE (YANG SUDAH BERSIH) UNTUK PREDIKSI
-                img_tensor = transform(final_image).unsqueeze(0)
+                img_tensor = transform(final_image).unsqueeze(0).to(DEVICE)
                 
-                all_results = {"Jenis Penyakit": CLASS_NAMES}
-                model_names = []
+                all_results = {"Kelas Penyakit": CLASS_NAMES}
+                active_models = []
+                attention_maps = {} 
                 
+                # Loop Prediksi
                 for model_name, model in loaded_models.items():
                     if model:
-                        model_names.append(model_name)
-                        probs = predict_probabilities(model, img_tensor)
+                        active_models.append(model_name)
+                        probs, attn_map = predict_probabilities(model, img_tensor)
                         all_results[model_name] = probs
+                        attention_maps[model_name] = attn_map
                 
                 df_results = pd.DataFrame(all_results)
+                
+                # TAMPILAN HORIZONTAL
+                if active_models:
+                    # Membuat kolom sebanyak jumlah model aktif
+                    cols = st.columns(len(active_models))
+                    
+                    for idx, m_name in enumerate(active_models):
+                        best_idx = df_results[m_name].idxmax()
+                        best_class = df_results.loc[best_idx, "Kelas Penyakit"]
+                        best_conf = df_results.loc[best_idx, m_name]
+                        
+                        # Memasukkan konten ke dalam kolom spesifik
+                        with cols[idx]:
+                            st.markdown(f"#### {m_name}") # Nama Model
+                            
+                            # Tampilkan Metric
+                            st.metric(
+                                label="Prediksi",
+                                value=best_class,
+                                delta=f"{best_conf*100:.2f}% Conf"
+                            )
+                            
+                            # Tampilkan Heatmap
+                            if attention_maps[m_name] is not None:
+                                heatmap_img = generate_heatmap(final_image, attention_maps[m_name], model_name=m_name)
+                                st.image(heatmap_img, caption=f"Attention: {m_name}", use_container_width=True)
+                            else:
+                                st.image(final_image, caption="No Attention Map", use_container_width=True)
 
-                # SUMMARY
-                st.subheader("🏆 Prediksi Utama")
-                summary_cols = st.columns(len(model_names))
-                for idx, m_name in enumerate(model_names):
-                    best_idx = df_results[m_name].idxmax()
-                    best_class = df_results.loc[best_idx, "Jenis Penyakit"]
-                    best_conf = df_results.loc[best_idx, m_name]
-                    with summary_cols[idx]:
-                        st.info(f"**{m_name}**\n\n### {best_class}\n\nConf: **{best_conf*100:.2f}%**")
+                # --- BAGIAN 3: TABEL PROBABILITAS (PALING BAWAH) ---
+                st.divider()
+                st.subheader("📑 Detail Probabilitas Lengkap")
+                
+                # Format Progress Bar
+                col_config = {
+                    "Kelas Penyakit": st.column_config.TextColumn("Kelas Penyakit", width="medium")
+                }
+                for m_name in active_models:
+                    col_config[m_name] = st.column_config.ProgressColumn(
+                        m_name, format="%.4f", min_value=0, max_value=1
+                    )
 
-                # TABEL DETAIL
-                st.markdown("---")
-                st.subheader("📊 Tabel Probabilitas Lengkap")
-                column_config = {"Jenis Penyakit": st.column_config.TextColumn("Jenis Penyakit", width="medium")}
-                for m_name in model_names:
-                    column_config[m_name] = st.column_config.ProgressColumn(m_name, format="%.2f%%", min_value=0, max_value=1)
+                st.dataframe(df_results, use_container_width=True, hide_index=True, column_config=col_config)
 
-                st.dataframe(df_results, column_config=column_config, hide_index=True, use_container_width=True, height=300)
-else:
-    st.info("👋 Silakan upload gambar melalui sidebar.")
+# ==========================================
+# TAB 2: SINTESIS GENERATOR
+# ==========================================
+with tab_synthesis:
+    st.header("Visualisasi Augmentasi Generatif")
+    
+    col_params, col_display = st.columns([1, 2])
+    
+    with col_params:
+        st.subheader("Parameter Sintesis")
+        gen_model_choice = st.selectbox("Pilih Model Generatif", ["ACGAN", "WGAN-GP", "ACWGAN-GP"])
+        
+        is_conditional = (gen_model_choice != "WGAN-GP")
+        
+        target_label_idx = 0
+        target_class_name = "Random"
+        
+        if is_conditional:
+            target_class_name = st.selectbox("Pilih Kelas Target", GEN_CLASSES)
+            target_label_idx = GEN_CLASSES.index(target_class_name)
+        else:
+            st.info("Mode Unconditional (Random)")
+        
+        num_samples = st.slider("Jumlah Sampel", 1, 10, 5)
+        generate_btn = st.button("Generate Citra", type="primary")
+
+    with col_display:
+        st.subheader("Hasil Sintesis")
+        
+        if generate_btn:
+            with st.spinner(f"Memuat model {gen_model_choice}..."):
+                generator, model_is_conditional = load_generator(gen_model_choice)
+                
+                if generator:
+                    latent_dim = 100 
+                    noise = torch.randn(num_samples, latent_dim).to(DEVICE)
+                    
+                    fake_imgs_tensor = None
+                    with torch.no_grad():
+                        if model_is_conditional:
+                            label_tensor = torch.full((num_samples,), target_label_idx, dtype=torch.long).to(DEVICE)
+                            fake_imgs_tensor = generator(noise, labels=label_tensor)
+                        else:
+                            fake_imgs_tensor = generator(noise)
+                    
+                    # Tampilkan Grid
+                    cols = st.columns(5) # Max 5 per row
+                    for i in range(num_samples):
+                        img_t = fake_imgs_tensor[i]
+                        img_t = (img_t * 0.5) + 0.5 
+                        ndarr = img_t.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+                        im_result = Image.fromarray(ndarr)
+                        
+                        row_idx = i // 5
+                        col_idx = i % 5
+                        
+                        with cols[col_idx]:
+                            st.image(im_result, caption=f"Img {i+1}", use_container_width=True)
+                    
+                    st.success("Selesai.")
+                    
+# venv\Scripts\activate
+
